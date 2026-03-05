@@ -455,13 +455,32 @@ export function createPolicyUpdater(
             let existingData: { rule?: TomlRule[] } = {};
             try {
               const fileContent = await fs.readFile(policyFile, 'utf-8');
-              const parsed = toml.parse(fileContent);
-              if (
-                typeof parsed === 'object' &&
-                parsed !== null &&
-                (!('rule' in parsed) || Array.isArray(parsed['rule']))
-              ) {
-                existingData = parsed as { rule?: TomlRule[] };
+              try {
+                const parsed = toml.parse(fileContent);
+                if (
+                  typeof parsed === 'object' &&
+                  parsed !== null &&
+                  (!('rule' in parsed) || Array.isArray(parsed['rule']))
+                ) {
+                  existingData = parsed as { rule?: TomlRule[] };
+                }
+              } catch (_parseError) {
+                // The file exists but contains invalid TOML. This can brick the CLI.
+                // Backup the corrupted file and start fresh.
+                const backupFile = `${policyFile}.bak`;
+                try {
+                  await fs.copyFile(policyFile, backupFile);
+                  coreEvents.emitFeedback(
+                    'warning',
+                    `Corrupted policy file detected and backed up to ${backupFile}. Starting with empty policy.`,
+                  );
+                } catch (_backupError) {
+                  coreEvents.emitFeedback(
+                    'warning',
+                    `Corrupted policy file detected but could not be backed up to ${backupFile}. Starting with empty policy.`,
+                  );
+                }
+                // Leave existingData as empty {}
               }
             } catch (error) {
               if (isNodeError(error) && error.code === 'ENOENT') {
@@ -529,8 +548,12 @@ export function createPolicyUpdater(
               await fs.rename(tmpFile, policyFile);
             } catch (renameError) {
               // Cross-device rename fails with EXDEV on some Linux mount configurations.
+              // Emulated environments like Docker can sometimes throw EBUSY when overwriting via rename.
               // Fall back to copy + unlink which works across filesystems.
-              if (isNodeError(renameError) && renameError.code === 'EXDEV') {
+              if (
+                isNodeError(renameError) &&
+                (renameError.code === 'EXDEV' || renameError.code === 'EBUSY')
+              ) {
                 await fs.copyFile(tmpFile, policyFile);
                 await fs.unlink(tmpFile).catch(() => {});
               } else {

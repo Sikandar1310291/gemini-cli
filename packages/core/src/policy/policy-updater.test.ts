@@ -53,6 +53,9 @@ describe('createPolicyUpdater', () => {
     vi.spyOn(mockStorage, 'getWorkspacePoliciesDir').mockReturnValue(
       '/mock/project/.gemini/policies',
     );
+    vi.spyOn(mockStorage, 'getAutoSavedPolicyPath').mockReturnValue(
+      '/mock/project/.gemini/policies/auto-saved.toml',
+    );
   });
 
   afterEach(() => {
@@ -144,6 +147,102 @@ describe('createPolicyUpdater', () => {
 
       expect(parsed.rule).toHaveLength(1);
       expect(parsed.rule![0].commandPrefix).toEqual(['echo', 'ls']);
+    });
+  });
+
+  it('should backup corrupted TOML and persist empty state', async () => {
+    createPolicyUpdater(policyEngine, messageBus, mockStorage);
+
+    // Simulate corrupted TOML file
+    vi.mocked(fs.readFile).mockResolvedValue('invalid toml;;::[');
+    vi.mocked(fs.copyFile).mockResolvedValue(undefined); // Backup succeeds
+    vi.mocked(fs.mkdir).mockResolvedValue(undefined);
+
+    const mockFileHandle = {
+      writeFile: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+    };
+    vi.mocked(fs.open).mockResolvedValue(
+      mockFileHandle as unknown as fs.FileHandle,
+    );
+    vi.mocked(fs.rename).mockResolvedValue(undefined);
+
+    await messageBus.publish({
+      type: MessageBusType.UPDATE_POLICY,
+      toolName: 'run_shell_command',
+      commandPrefix: 'ls',
+      persist: true,
+    });
+
+    await vi.waitFor(() => {
+      // Expect backup to happen
+      expect(fs.copyFile).toHaveBeenCalledWith(
+        '/mock/project/.gemini/policies/auto-saved.toml',
+        '/mock/project/.gemini/policies/auto-saved.toml.bak',
+      );
+
+      // Expect file to be written from fresh state
+      expect(fs.open).toHaveBeenCalled();
+      const [content] = mockFileHandle.writeFile.mock.calls[0] as [
+        string,
+        string,
+      ];
+      const parsed = toml.parse(content) as unknown as ParsedPolicy;
+
+      expect(parsed.rule).toHaveLength(1);
+      expect(parsed.rule![0].commandPrefix).toEqual('ls');
+    });
+  });
+
+  it('should fallback to copyFile and unlink on EBUSY during rename', async () => {
+    createPolicyUpdater(policyEngine, messageBus, mockStorage);
+
+    // Start fresh
+    const enoentError = Object.assign(
+      new Error('ENOENT: no such file or directory'),
+      { code: 'ENOENT' },
+    );
+    vi.mocked(fs.readFile).mockRejectedValue(enoentError);
+    vi.mocked(fs.mkdir).mockResolvedValue(undefined);
+
+    const mockFileHandle = {
+      writeFile: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+    };
+    vi.mocked(fs.open).mockResolvedValue(
+      mockFileHandle as unknown as fs.FileHandle,
+    );
+
+    // Simulate EBUSY on rename
+    const ebusyError = Object.assign(
+      new Error('EBUSY: resource busy or locked'),
+      { code: 'EBUSY' },
+    );
+    vi.mocked(fs.rename).mockRejectedValue(ebusyError);
+    vi.mocked(fs.copyFile).mockResolvedValue(undefined);
+    vi.mocked(fs.unlink).mockResolvedValue(undefined);
+
+    await messageBus.publish({
+      type: MessageBusType.UPDATE_POLICY,
+      toolName: 'run_shell_command',
+      commandPrefix: 'ls',
+      persist: true,
+    });
+
+    await vi.waitFor(() => {
+      // Expect fallback to copyFile and unlink
+      expect(fs.rename).toHaveBeenCalled();
+      expect(fs.copyFile).toHaveBeenCalledWith(
+        expect.stringMatching(
+          /\.gemini[/\\]policies[/\\]auto-saved\.toml\..*\.tmp$/,
+        ),
+        '/mock/project/.gemini/policies/auto-saved.toml',
+      );
+      expect(fs.unlink).toHaveBeenCalledWith(
+        expect.stringMatching(
+          /\.gemini[/\\]policies[/\\]auto-saved\.toml\..*\.tmp$/,
+        ),
+      );
     });
   });
 
